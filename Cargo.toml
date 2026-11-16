@@ -1,6 +1,6 @@
 [package]
 name = "discord-voice"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Shows Discord voice call members in Waybar using the local Discord client's RPC socket"
 license = "MIT"

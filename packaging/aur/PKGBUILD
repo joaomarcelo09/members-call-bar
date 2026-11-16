@@ -16,7 +16,7 @@
 
 pkgname=discord-voice-waybar
 _name=members-call-bar
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Shows Discord voice call members in Waybar using the local Discord client's RPC socket"
 arch=('x86_64' 'aarch64')
