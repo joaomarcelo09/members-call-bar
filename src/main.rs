@@ -1,6 +1,7 @@
 //! `discord-voice`: shows the members of the current Discord voice call in
 //! Waybar, using the local Discord client's RPC socket.
 
+mod api;
 mod auth;
 mod avatars;
 mod config;
@@ -10,6 +11,7 @@ mod ipc;
 mod layout;
 mod notify;
 mod output;
+mod popup;
 mod render;
 mod rpc;
 mod state;
@@ -34,7 +36,8 @@ use crate::supervisor::{Backoff, Connector};
 /// AUTHORIZE, which waits for the user).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const USAGE: &str = "usage: discord-voice [events|state|run|slot <n>|status|focus]
+const USAGE: &str =
+    "usage: discord-voice [events|state|run|slot <n>|status|focus|watch|popup [toggle]]
 
 Commands:
   events    connect to Discord and print voice events (default)
@@ -48,6 +51,11 @@ Commands:
             nothing when the slot is empty
   status    tell whether the daemon runs and what call it shows
   focus     run `focus_command` (Waybar on-click) to raise Discord
+  watch     print the daemon's local JSON API stream (one line per change)
+  popup [toggle]
+            show the call in a popup panel (needs the `popup` build
+            feature, otherwise it runs `focus`); `toggle` closes it
+            instead if it is already open
 
 Config: $XDG_CONFIG_HOME/discord-voice/config.toml (see README.md).
 Logging: set RUST_LOG (e.g. RUST_LOG=debug); logs go to stderr.";
@@ -70,11 +78,21 @@ fn main() -> Result<()> {
         }
         Some("focus") => {
             // Never blocks, never fails: the command runs detached.
-            let settings = config::config_path()
-                .map(|p| config::load_settings_or_default(&p))
-                .unwrap_or_default();
+            let settings = load_settings_lenient();
             focus::spawn_detached(&settings.focus_command);
             return Ok(());
+        }
+        Some("watch") => {
+            let settings = load_settings_lenient();
+            return api::watch(&api::socket_path(&settings)?);
+        }
+        Some("popup") => {
+            let toggle = match args.get(1).map(String::as_str) {
+                None => false,
+                Some("toggle") => true,
+                Some(other) => bail!("unknown popup argument `{other}`\n\n{USAGE}"),
+            };
+            return popup::run(&load_settings_lenient(), toggle);
         }
         _ => {}
     }
@@ -88,6 +106,13 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async_main(args))
+}
+
+/// Settings for commands that need no credentials.
+fn load_settings_lenient() -> config::Settings {
+    config::config_path()
+        .map(|p| config::load_settings_or_default(&p))
+        .unwrap_or_default()
 }
 
 async fn async_main(args: Vec<String>) -> Result<()> {
@@ -290,6 +315,10 @@ async fn run_daemon() -> Result<()> {
     let notifier = notify::Notifier::spawn(notify::WaybarSignaler {
         signal_base: settings.signal_base,
     });
+    let api = settings
+        .api
+        .then(|| start_api(&settings, rx.clone(), link_rx.clone()))
+        .flatten();
     let renderer = tokio::spawn(daemon::run(rx, link_rx, cache, writer, notifier, settings));
 
     let mut connector = RpcConnector { setup };
@@ -309,7 +338,41 @@ async fn run_daemon() -> Result<()> {
     {
         tracing::warn!("renderer did not stop in time");
     }
+    if let Some((task, guard)) = api {
+        if tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("API did not stop in time");
+        }
+        // Removes the socket.
+        drop(guard);
+    }
     Ok(())
+}
+
+/// Binds the local API socket and serves it. Failures only disable the API.
+fn start_api(
+    settings: &config::Settings,
+    rx: watch::Receiver<Snapshot>,
+    link: watch::Receiver<bool>,
+) -> Option<(tokio::task::JoinHandle<()>, api::SocketGuard)> {
+    let started = (|| {
+        let path = api::socket_path(settings)?;
+        let (listener, guard) = api::bind(&path)?;
+        let cache = AvatarCache::new(avatars::default_cache_dir()?, HttpFetcher::new()?);
+        anyhow::Ok((listener, guard, cache))
+    })();
+    match started {
+        Ok((listener, guard, cache)) => {
+            tracing::info!(socket = %guard.path().display(), "serving local API");
+            Some((tokio::spawn(api::serve(listener, rx, link, cache)), guard))
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "local API disabled");
+            None
+        }
+    }
 }
 
 /// RPC event loop feeding the tracker until the connection fails.

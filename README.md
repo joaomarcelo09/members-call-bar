@@ -88,6 +88,10 @@ reported with a clear error at start-up. Restart the daemon after editing
 | `show_self` | `true` | Show your own user (always in the first slot). |
 | `sort` | `"join"` | `"join"`: join order. `"speaking"`: most recently speaking first (your own user stays first if shown). |
 | `focus_command` | `"hyprctl dispatch focuswindow class:discord"` | Run by `discord-voice focus` (slot click). Split into words with shell-like quoting (`'...'`, `"..."`, `\`), run directly without a shell. E.g. `"swaymsg '[class=\"discord\"] focus'"`. |
+| `api` | `true` | Serve the [local JSON API](#local-api) (needed by the popup). |
+| `api_socket` | `$XDG_RUNTIME_DIR/discord-voice/api.sock` | Absolute path of the API socket. |
+| `popup_anchor` | `"top-right"` | Screen corner of the [popup](#popup): `"top-left"`, `"top-right"`, `"bottom-left"` or `"bottom-right"`. |
+| `popup_margin_top`, `popup_margin_right`, `popup_margin_bottom`, `popup_margin_left` | `8` | Distance in pixels from the screen edges of the anchor corner (0 to 4000; the other two are ignored). The top margin counts from below Waybar. |
 
 Full example:
 
@@ -183,9 +187,89 @@ back within seconds of Discord starting again. `discord-voice status` shows
    non-default `slots`, use `slots + 1` modules (the last one is the overflow
    badge).
 3. Clicking a slot runs `discord-voice focus`, which starts `focus_command`
-   detached and returns immediately (errors are ignored).
+   detached and returns immediately (errors are ignored). In the sample
+   config, slot 0 (the first slot) instead toggles the [popup](#popup) on
+   click (`discord-voice popup toggle`) and raises Discord on right-click;
+   a build without the `popup` feature runs `focus_command` for
+   `discord-voice popup` instead, so the click still raises Discord. Waybar modules have no hover action: hovering a
+   slot shows its tooltip, a click opens the popup.
 
 `discord-voice status` tells whether the daemon runs, whether it is connected
 and which call it shows.
+
+## Local API
+
+While `api = true` (the default), the daemon serves the call state on the Unix
+socket `$XDG_RUNTIME_DIR/discord-voice/api.sock` (directory 0700, socket 0600,
+so only your user can connect; set `api_socket` to move it). A stale socket
+from a crashed run is replaced at start-up and the socket is removed on exit.
+
+The protocol is newline-delimited JSON, from the daemon to the client: one
+line with the current state right after connecting, then one line per change
+(speaking, mute/deaf, members joining or leaving, channel, connection to
+Discord). Changes are coalesced to at most ~20 lines per second and identical
+states are not repeated. Anything the client sends is ignored. Each line looks
+like this (shown on several lines here):
+
+```json
+{"connected": true,
+ "channel": {"id": "199737254929760256", "name": "General"},
+ "members": [
+   {"user_id": "190320984123768832", "name": "test", "speaking": false,
+    "muted": true, "deafened": false, "self": true,
+    "avatar": "/home/u/.cache/discord-voice/avatars/190320984123768832_b004ec1740a63ca06ae2e14c5cee11f3.png"},
+   {"user_id": "53908232506183680", "name": "Mason G", "speaking": true,
+    "muted": false, "deafened": false, "self": false, "avatar": null}
+ ]}
+```
+
+- `connected`: whether the daemon is connected to Discord; while it is not,
+  `channel` is `null` and `members` is empty.
+- `channel`: `null` outside a voice call; `name` may be `null`.
+- `members`: your own user first (`"self": true`), then the others in join
+  order. `muted`/`deafened` include server mute/deafen. `avatar` is a local
+  PNG file, or `null` while it downloads (a new line follows when it is ready).
+
+`discord-voice watch` prints the stream (it fails with a clear error when no
+daemon is running). Without it, e.g. with `socat` and `jq`:
+
+```sh
+socat -u UNIX-CONNECT:"$XDG_RUNTIME_DIR/discord-voice/api.sock" - \
+  | jq -c '[.members[] | select(.speaking) | .name]'
+```
+
+The daemon never waits for API clients: a client that does not keep up (16
+queued lines) or whose socket stalls for 2 s is disconnected, and at most 32
+clients are served at once.
+
+## Popup
+
+`discord-voice popup` shows a panel in a screen corner (top right by default,
+see `popup_anchor` and the `popup_margin_*` keys) with every call member: a
+96 px circular avatar, the name, a pulsing ring in `speaking_color` while
+speaking, and dimming (`dim`) plus "Muted"/"Deafened" while muted or
+deafened. It updates live from the [local API](#local-api), so the daemon must
+run with `api = true`. Esc or a click outside the panel closes it.
+`discord-voice popup toggle` closes an open popup instead of opening a second
+one (the open popup holds a lock on `$XDG_RUNTIME_DIR/discord-voice/popup.lock`),
+which is what the Waybar sample binds to a click on slot 0.
+
+It uses GTK4 with the wlr-layer-shell protocol (Hyprland, Sway, river and
+other wlroots compositors; on others it falls back to a normal window). It is
+behind the `popup` cargo feature, so the default build needs no GTK; a build
+without it makes `discord-voice popup` (and `popup toggle`) fall back to
+`discord-voice focus`: it starts `focus_command` detached and exits 0 (run
+with `RUST_LOG=debug` to see a line saying so). To build
+it, install `gtk4` and `gtk4-layer-shell` (Arch: `pacman -S gtk4
+gtk4-layer-shell`; `pkgconf` is needed at build time), then:
+
+```sh
+cargo install --path . --features popup
+# or: cargo build --release --features popup
+```
+
+The AUR PKGBUILD builds without the popup by default; build the package with
+`_popup=1 makepkg -si` to enable it (this adds `gtk4` and `gtk4-layer-shell`
+to the dependencies).
 
 Secrets and tokens are never logged. No telemetry.
