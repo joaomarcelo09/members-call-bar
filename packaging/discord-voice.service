@@ -1,0 +1,12 @@
+[Unit]
+Description=Discord voice call members for Waybar
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/discord-voice run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
