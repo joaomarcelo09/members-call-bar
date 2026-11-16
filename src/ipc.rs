@@ -148,8 +148,13 @@ pub struct IpcConnection {
 }
 
 impl IpcConnection {
-    /// Connects to the first reachable socket among the default candidates.
-    pub async fn connect() -> Result<(Self, PathBuf)> {
+    /// Connects to `socket_path` if given (the `socket_path` setting),
+    /// otherwise to the first reachable socket among the default candidates.
+    pub async fn connect(socket_path: Option<&Path>) -> Result<(Self, PathBuf)> {
+        if let Some(path) = socket_path {
+            let conn = Self::connect_path(path).await?;
+            return Ok((conn, path.to_path_buf()));
+        }
         let candidates = candidate_paths(&default_base_dirs());
         for path in &candidates {
             if !path.exists() {
@@ -338,5 +343,22 @@ mod tests {
             paths[29],
             PathBuf::from("/run/user/1000/snap.discord/discord-ipc-9")
         );
+    }
+
+    #[tokio::test]
+    async fn connect_uses_socket_path_override() {
+        let dir = std::env::temp_dir().join(format!("discord-voice-ipc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom-ipc");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.is_ok() });
+        let (_conn, used) = IpcConnection::connect(Some(&path)).await.unwrap();
+        assert_eq!(used, path);
+        assert!(accept.await.unwrap());
+        // An override that does not work is an error, not a fallback.
+        assert!(IpcConnection::connect(Some(&dir.join("missing")))
+            .await
+            .is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -77,6 +77,29 @@ struct OAuthError {
     error: String,
 }
 
+/// The token endpoint answered with an error status (e.g. `invalid_grant`
+/// for a revoked or expired refresh token), as opposed to a network error.
+#[derive(Debug)]
+pub struct TokenRejected {
+    pub status: reqwest::StatusCode,
+    pub code: String,
+}
+
+impl fmt::Display for TokenRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "token endpoint returned {} ({})", self.status, self.code)
+    }
+}
+
+impl std::error::Error for TokenRejected {}
+
+/// Whether a refresh error means the refresh token itself is unusable, so
+/// the user must authorize again. Network errors keep the token.
+pub fn refresh_token_rejected(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TokenRejected>()
+        .is_some_and(|r| r.status.is_client_error())
+}
+
 pub fn config_dir() -> Result<PathBuf> {
     let base = dirs::config_dir().ok_or_else(|| anyhow!("cannot determine config directory"))?;
     Ok(base.join("discord-voice"))
@@ -115,7 +138,8 @@ pub fn parse_config(text: &str) -> Result<Config> {
     Ok(cfg)
 }
 
-pub fn load_config(path: &Path) -> Result<Config> {
+/// Reads the config file, refusing it if missing or not private.
+pub fn read_private_config(path: &Path) -> Result<String> {
     if !path.exists() {
         bail!(
             "config file {} not found; see README.md for setup",
@@ -123,9 +147,25 @@ pub fn load_config(path: &Path) -> Result<Config> {
         );
     }
     check_private(path)?;
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))
+}
+
+/// Credentials only; the binary uses `config::load`, which also reads the
+/// optional settings from the same file.
+#[allow(dead_code)]
+pub fn load_config(path: &Path) -> Result<Config> {
+    let text = read_private_config(path)?;
     parse_config(&text).with_context(|| format!("in {}", path.display()))
+}
+
+/// Deletes a token that Discord no longer accepts, so the next start does
+/// not try it again.
+pub fn discard_token(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => tracing::info!(path = %path.display(), "deleted rejected token"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "cannot delete token"),
+    }
 }
 
 pub fn load_token(path: &Path) -> Option<Token> {
@@ -175,7 +215,7 @@ async fn token_request(form: &[(&str, &str)]) -> Result<Token> {
             .await
             .map(|e| e.error)
             .unwrap_or_else(|_| "unknown".into());
-        bail!("token endpoint returned {status} ({code})");
+        return Err(TokenRejected { status, code }.into());
     }
     let body: TokenResponse = resp
         .json()
@@ -231,10 +271,18 @@ pub async fn authenticate(rpc: &mut RpcClient, cfg: &Config, token_path: &Path) 
                 save_token(token_path, &new)?;
                 match rpc.authenticate(&new.access_token).await {
                     Ok(user) => return Ok(user),
-                    Err(e) => tracing::warn!(error = %e, "refreshed token rejected"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "refreshed token rejected; re-authorizing");
+                        discard_token(token_path);
+                    }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "token refresh failed; re-authorizing"),
+            Err(e) if refresh_token_rejected(&e) => {
+                tracing::warn!(error = %e, "refresh token rejected or expired; re-authorizing");
+                discard_token(token_path);
+            }
+            // Network trouble: keep the token and let the caller retry later.
+            Err(e) => return Err(e.context("token refresh failed")),
         }
     }
     let token = authorize(rpc, cfg).await?;
@@ -305,6 +353,40 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(load_token(&path), Some(t.clone()));
         save_token(&path, &t).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_refresh_is_told_apart_from_network_errors() {
+        let rejected: anyhow::Error = TokenRejected {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            code: "invalid_grant".into(),
+        }
+        .into();
+        assert!(refresh_token_rejected(&rejected));
+        assert_eq!(
+            rejected.to_string(),
+            "token endpoint returned 400 Bad Request (invalid_grant)"
+        );
+        let server: anyhow::Error = TokenRejected {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            code: "unknown".into(),
+        }
+        .into();
+        assert!(!refresh_token_rejected(&server));
+        assert!(!refresh_token_rejected(&anyhow!(
+            "token request failed: timeout"
+        )));
+    }
+
+    #[test]
+    fn discard_token_deletes_file() {
+        let dir = tmp_dir("discard");
+        let path = dir.join("token.json");
+        std::fs::write(&path, "{}").unwrap();
+        discard_token(&path);
+        assert!(!path.exists());
+        discard_token(&path); // missing file is fine
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -3,44 +3,62 @@
 // Uses Waybar's `image` module type (custom modules cannot show images). Each
 // module shows one call member. The `discord-voice run` daemon writes the
 // slot files and sends SIGRTMIN+<signal> to Waybar when a slot changes, so no
-// polling `interval` is needed. Slot n uses signal 8+n (notify::SIGNAL_BASE).
-// An empty slot prints nothing, which hides the module outside a call.
+// polling `interval` is needed. Slot n uses signal `signal_base` + n (default
+// 8). An empty slot prints nothing, which hides the module outside a call.
+//
+// With the default `slots = 5`, slots 0-4 show members and slot 5 is the
+// "+K" overflow badge (its tooltip lists the hidden members). For another
+// `slots` value, add or remove modules so there are `slots` + 1 of them.
+// Clicking any slot runs `focus_command` to raise the Discord window.
 {
   "modules-right": [
     "image#discord-voice-0",
     "image#discord-voice-1",
     "image#discord-voice-2",
     "image#discord-voice-3",
-    "image#discord-voice-4"
+    "image#discord-voice-4",
+    "image#discord-voice-5"
   ],
   "image#discord-voice-0": {
     "exec": "discord-voice slot 0",
     "signal": 8,
     "size": 24,
-    "tooltip": true
+    "tooltip": true,
+    "on-click": "discord-voice focus"
   },
   "image#discord-voice-1": {
     "exec": "discord-voice slot 1",
     "signal": 9,
     "size": 24,
-    "tooltip": true
+    "tooltip": true,
+    "on-click": "discord-voice focus"
   },
   "image#discord-voice-2": {
     "exec": "discord-voice slot 2",
     "signal": 10,
     "size": 24,
-    "tooltip": true
+    "tooltip": true,
+    "on-click": "discord-voice focus"
   },
   "image#discord-voice-3": {
     "exec": "discord-voice slot 3",
     "signal": 11,
     "size": 24,
-    "tooltip": true
+    "tooltip": true,
+    "on-click": "discord-voice focus"
   },
   "image#discord-voice-4": {
     "exec": "discord-voice slot 4",
     "signal": 12,
     "size": 24,
-    "tooltip": true
+    "tooltip": true,
+    "on-click": "discord-voice focus"
+  },
+  "image#discord-voice-5": {
+    "exec": "discord-voice slot 5",
+    "signal": 13,
+    "size": 24,
+    "tooltip": true,
+    "on-click": "discord-voice focus"
   }
 }

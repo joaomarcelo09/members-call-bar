@@ -1,8 +1,9 @@
 //! Tells Waybar to re-run `discord-voice slot <n>` for changed slots.
 //!
 //! Waybar's `signal: N` option makes a custom module refresh on
-//! `SIGRTMIN+N`. Slot `n` uses `N = SIGNAL_BASE + n`, so the sample config
-//! sets `signal` to 8..=12 for slots 0..=4. Changes are coalesced for
+//! `SIGRTMIN+N`. Slot `n` uses `N = signal_base + n` (setting, default 8),
+//! so the sample config sets `signal` to 8..=13 for slots 0..=5 (5 member
+//! slots plus overflow). Changes are coalesced for
 //! [`COALESCE`] and limited to about [`MAX_SIGNALS_PER_SEC`] signals per
 //! second overall; errors are ignored.
 
@@ -11,10 +12,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::output::SLOTS;
+use crate::output::MAX_SLOT_FILES;
 
-/// Waybar `signal` value of slot 0; slot `n` uses `SIGNAL_BASE + n`.
-pub const SIGNAL_BASE: i32 = 8;
 /// Changes arriving within this window are sent as one batch.
 pub const COALESCE: Duration = Duration::from_millis(50);
 /// Overall signal budget (token bucket rate and burst size).
@@ -26,23 +25,27 @@ pub trait SignalSender: Send + 'static {
 }
 
 /// Signals every `waybar` process of this user (best effort).
-pub struct WaybarSignaler;
+pub struct WaybarSignaler {
+    /// Waybar `signal` value of slot 0.
+    pub signal_base: i32,
+}
 
 impl SignalSender for WaybarSignaler {
     fn send(&self, slots: &[usize]) {
         let slots = slots.to_vec();
+        let base = self.signal_base;
         // Scanning /proc is blocking file I/O: keep it off the event loop.
-        tokio::task::spawn_blocking(move || signal_waybar(&slots));
+        tokio::task::spawn_blocking(move || signal_waybar(base, &slots));
     }
 }
 
-/// Sends `SIGRTMIN + SIGNAL_BASE + slot` to every process named `waybar`.
+/// Sends `SIGRTMIN + signal_base + slot` to every process named `waybar`.
 /// Blocking but quick; ignores all errors.
-pub fn signal_waybar(slots: &[usize]) {
+pub fn signal_waybar(signal_base: i32, slots: &[usize]) {
     let signals: Vec<i32> = slots
         .iter()
-        .filter(|&&s| s < SLOTS)
-        .map(|&s| libc::SIGRTMIN() + SIGNAL_BASE + s as i32)
+        .filter(|&&s| s < MAX_SLOT_FILES)
+        .map(|&s| libc::SIGRTMIN() + signal_base + s as i32)
         .filter(|&sig| sig <= libc::SIGRTMAX())
         .collect();
     if signals.is_empty() {
@@ -137,7 +140,7 @@ impl Notifier {
 
 async fn run(mut rx: mpsc::UnboundedReceiver<usize>, sender: impl SignalSender) {
     let mut bucket = TokenBucket::new(MAX_SIGNALS_PER_SEC, Instant::now());
-    let mut pending = [false; SLOTS];
+    let mut pending = [false; MAX_SLOT_FILES];
     let mut open = true;
     loop {
         if !pending.contains(&true) {
@@ -145,7 +148,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<usize>, sender: impl SignalSender) 
                 return;
             }
             match rx.recv().await {
-                Some(slot) if slot < SLOTS => pending[slot] = true,
+                Some(slot) if slot < MAX_SLOT_FILES => pending[slot] = true,
                 Some(_) => continue,
                 None => return,
             }
@@ -153,7 +156,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<usize>, sender: impl SignalSender) 
         tokio::time::sleep(COALESCE).await;
         loop {
             match rx.try_recv() {
-                Ok(slot) if slot < SLOTS => pending[slot] = true,
+                Ok(slot) if slot < MAX_SLOT_FILES => pending[slot] = true,
                 Ok(_) => {}
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -184,6 +187,8 @@ async fn run(mut rx: mpsc::UnboundedReceiver<usize>, sender: impl SignalSender) 
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    const SLOTS: usize = 5;
 
     #[derive(Clone, Default)]
     struct Recorder(Arc<Mutex<Vec<Vec<usize>>>>);
@@ -224,7 +229,7 @@ mod tests {
         n.notify(1);
         n.notify(0);
         n.notify(1);
-        n.notify(SLOTS); // out of range: ignored
+        n.notify(MAX_SLOT_FILES); // out of range: ignored
         tokio::time::sleep(Duration::from_millis(40)).await;
         n.notify(0);
         assert!(rec.batches().is_empty());

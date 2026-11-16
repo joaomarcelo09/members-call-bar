@@ -3,15 +3,20 @@
 
 mod auth;
 mod avatars;
+mod config;
 mod daemon;
+mod focus;
 mod ipc;
+mod layout;
 mod notify;
 mod output;
 mod render;
 mod rpc;
 mod state;
+mod supervisor;
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -23,18 +28,26 @@ use tokio::sync::watch;
 use crate::avatars::{AvatarCache, Fetcher, HttpFetcher};
 use crate::rpc::{RpcClient, User, VoiceChannel, VoiceEvent, VoiceMember};
 use crate::state::{MemberState, Snapshot, StateTracker};
+use crate::supervisor::{Backoff, Connector};
 
-const USAGE: &str = "usage: discord-voice [events|state|run|slot <n>|status]
+/// Limit for reaching Discord's socket and getting READY (not for
+/// AUTHORIZE, which waits for the user).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+const USAGE: &str = "usage: discord-voice [events|state|run|slot <n>|status|focus]
 
 Commands:
   events    connect to Discord and print voice events (default)
   state     track the call and print its state (members, flags, avatar
             files) whenever it changes
   run       daemon: render call members into Waybar slot files
-            ($XDG_RUNTIME_DIR/discord-voice/) and signal Waybar
-  slot <n>  print slot n (0-4) for a Waybar `image` module: image path and
-            tooltip, or nothing when the slot is empty
+            ($XDG_RUNTIME_DIR/discord-voice/) and signal Waybar;
+            reconnects automatically when Discord restarts
+  slot <n>  print slot n for a Waybar `image` module (0..slots-1: members,
+            slot `slots`: \"+K\" overflow): image path and tooltip, or
+            nothing when the slot is empty
   status    tell whether the daemon runs and what call it shows
+  focus     run `focus_command` (Waybar on-click) to raise Discord
 
 Config: $XDG_CONFIG_HOME/discord-voice/config.toml (see README.md).
 Logging: set RUST_LOG (e.g. RUST_LOG=debug); logs go to stderr.";
@@ -53,6 +66,14 @@ fn main() -> Result<()> {
                 Err(_) => "not running".to_owned(),
             };
             println!("{report}");
+            return Ok(());
+        }
+        Some("focus") => {
+            // Never blocks, never fails: the command runs detached.
+            let settings = config::config_path()
+                .map(|p| config::load_settings_or_default(&p))
+                .unwrap_or_default();
+            focus::spawn_detached(&settings.focus_command);
             return Ok(());
         }
         _ => {}
@@ -82,23 +103,56 @@ async fn async_main(args: Vec<String>) -> Result<()> {
     }
 }
 
-/// Connects, handshakes and authenticates; returns the client and own user.
-async fn connect() -> Result<(RpcClient, User)> {
-    let dir = auth::config_dir()?;
-    let cfg = auth::load_config(&dir.join("config.toml"))?;
+/// Credentials, settings and where the token lives.
+struct Setup {
+    cfg: auth::Config,
+    settings: config::Settings,
+    token_path: PathBuf,
+}
 
-    let (mut conn, path) = ipc::IpcConnection::connect().await?;
-    tracing::info!(socket = %path.display(), "connected");
-    conn.handshake(&cfg.client_id).await?;
+fn load_setup() -> Result<Setup> {
+    let path = config::config_path()?;
+    let (cfg, settings) = config::load(&path)?;
+    Ok(Setup {
+        cfg,
+        settings,
+        token_path: auth::config_dir()?.join("token.json"),
+    })
+}
+
+/// Connects, handshakes and authenticates; returns the client and own user.
+async fn connect(
+    cfg: &auth::Config,
+    socket_path: Option<&Path>,
+    token_path: &Path,
+) -> Result<(RpcClient, User)> {
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let (mut conn, path) = ipc::IpcConnection::connect(socket_path).await?;
+        tracing::info!(socket = %path.display(), "connected");
+        conn.handshake(&cfg.client_id).await?;
+        anyhow::Ok(conn)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Discord did not answer the handshake in time"))??;
 
     let mut rpc = RpcClient::new(conn);
-    let user = auth::authenticate(&mut rpc, &cfg, &dir.join("token.json")).await?;
+    let user = auth::authenticate(&mut rpc, cfg, token_path).await?;
     tracing::info!(user_id = %user.id, "authenticated");
     Ok((rpc, user))
 }
 
+async fn connect_setup(setup: &Setup) -> Result<(RpcClient, User)> {
+    connect(
+        &setup.cfg,
+        setup.settings.socket_path.as_deref(),
+        &setup.token_path,
+    )
+    .await
+}
+
 async fn run_events() -> Result<()> {
-    let (mut rpc, _user) = connect().await?;
+    let setup = load_setup()?;
+    let (mut rpc, _user) = connect_setup(&setup).await?;
 
     rpc.subscribe("VOICE_CHANNEL_SELECT", json!({})).await?;
     let mut current: Option<String> = None;
@@ -171,14 +225,18 @@ fn member_line(m: &VoiceMember) -> String {
 }
 
 async fn run_state() -> Result<()> {
-    let (mut rpc, user) = connect().await?;
+    let setup = load_setup()?;
+    let (mut rpc, user) = connect_setup(&setup).await?;
     let (mut tracker, rx) = StateTracker::new();
     tracker.set_own_user_id(user.id);
 
     let cache = AvatarCache::new(avatars::default_cache_dir()?, HttpFetcher::new()?);
     let printer = tokio::spawn(print_states(rx, cache));
 
-    let result = track(&mut rpc, &mut tracker).await;
+    let result = tokio::select! {
+        r = track(&mut rpc, &mut tracker) => r,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
     printer.abort();
     result
 }
@@ -196,53 +254,72 @@ fn print_slot(arg: Option<&str>) {
     }
 }
 
+/// The daemon's real connector: one Discord RPC session per call.
+struct RpcConnector {
+    setup: Setup,
+}
+
+impl Connector for RpcConnector {
+    async fn session(
+        &mut self,
+        tracker: &mut StateTracker,
+        link: &watch::Sender<bool>,
+    ) -> Result<()> {
+        let (mut rpc, user) = connect_setup(&self.setup).await?;
+        tracker.set_own_user_id(user.id);
+        link.send_replace(true);
+        track(&mut rpc, tracker).await
+    }
+}
+
 /// `run`: tracks the call and renders it into Waybar slot files until
-/// Ctrl-C/SIGTERM or an RPC error. Slots are emptied on exit either way.
+/// Ctrl-C/SIGTERM. Connection errors are retried with backoff (slots are
+/// emptied while disconnected); slots are emptied on exit too.
 async fn run_daemon() -> Result<()> {
+    // Config errors are fatal; connection errors are retried.
+    let setup = load_setup()?;
+    let settings = setup.settings.clone();
     // Opening the writer also clears slots left by a crashed run.
-    let writer = output::SlotWriter::open(output::default_dir()?)?;
-    tracing::info!(dir = %writer.dir().display(), "writing Waybar slots");
+    let writer = output::SlotWriter::open(output::default_dir()?, settings.slot_files())?;
+    tracing::info!(dir = %writer.dir().display(), slots = settings.slots, "writing Waybar slots");
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    let (mut rpc, user) = connect().await?;
     let (mut tracker, rx) = StateTracker::new();
-    tracker.set_own_user_id(user.id);
-
+    let (link_tx, link_rx) = watch::channel(false);
     let cache = AvatarCache::new(avatars::default_cache_dir()?, HttpFetcher::new()?);
-    let notifier = notify::Notifier::spawn(notify::WaybarSignaler);
-    let renderer = tokio::spawn(daemon::run(rx, cache, writer, notifier));
+    let notifier = notify::Notifier::spawn(notify::WaybarSignaler {
+        signal_base: settings.signal_base,
+    });
+    let renderer = tokio::spawn(daemon::run(rx, link_rx, cache, writer, notifier, settings));
 
-    let result = tokio::select! {
-        r = track(&mut rpc, &mut tracker) => r,
-        _ = sigterm.recv() => Ok(()),
-    };
-    match &result {
-        Ok(()) => tracing::info!("shutting down"),
-        Err(e) => tracing::error!(error = %e, "RPC error, shutting down"),
+    let mut connector = RpcConnector { setup };
+    tokio::select! {
+        () = supervisor::supervise(&mut connector, &mut tracker, &link_tx, Backoff::default()) => {}
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
     }
+    tracing::info!("shutting down");
     // Dropping the tracker closes the snapshot channel: the renderer clears
     // the slots and exits.
     drop(tracker);
+    drop(link_tx);
     if tokio::time::timeout(Duration::from_secs(2), renderer)
         .await
         .is_err()
     {
         tracing::warn!("renderer did not stop in time");
     }
-    result
+    Ok(())
 }
 
-/// RPC event loop feeding the tracker until Ctrl-C.
+/// RPC event loop feeding the tracker until the connection fails.
 async fn track(rpc: &mut RpcClient, tracker: &mut StateTracker) -> Result<()> {
     rpc.subscribe("VOICE_CHANNEL_SELECT", json!({})).await?;
     let mut current: Option<String> = None;
     load_selected(rpc, tracker, &mut current).await?;
 
     loop {
-        let event = tokio::select! {
-            ev = rpc.next_event() => ev?,
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-        };
+        let event = rpc.next_event().await?;
         tracker.apply(&event);
         if let VoiceEvent::ChannelSelect { channel_id, .. } = event {
             if let Some(old) = current.take() {

@@ -1,0 +1,57 @@
+# Maintainer: Joao Gomes
+#
+# AUR package for discord-voice: Discord voice call members in Waybar.
+#
+# Before publishing to the AUR:
+#   1. Tag the release on GitHub (v$pkgver) and replace sha256sums=('SKIP')
+#      with the real checksum (`updpkgsums`).
+#   2. Generate .SRCINFO, which the AUR requires next to this file:
+#        makepkg --printsrcinfo > .SRCINFO
+#   3. Commit PKGBUILD and .SRCINFO to ssh://aur@aur.archlinux.org/discord-voice-waybar.git
+
+pkgname=discord-voice-waybar
+_name=members-call-bar
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Shows Discord voice call members in Waybar using the local Discord client's RPC socket"
+arch=('x86_64' 'aarch64')
+url="https://github.com/joaomarcelo09/members-call-bar"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=('waybar: the bar that shows the slots'
+            'hyprland: default click-to-focus command (hyprctl)')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$_name-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_name-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$_name-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen
+}
+
+package() {
+  cd "$_name-$pkgver"
+  install -Dm755 target/release/discord-voice "$pkgdir/usr/bin/discord-voice"
+  install -Dm644 packaging/discord-voice.service \
+    "$pkgdir/usr/lib/systemd/user/discord-voice.service"
+  install -Dm644 packaging/waybar-config.jsonc \
+    "$pkgdir/usr/share/doc/$pkgname/waybar-config.jsonc"
+  install -Dm644 packaging/waybar-style.css \
+    "$pkgdir/usr/share/doc/$pkgname/waybar-style.css"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
