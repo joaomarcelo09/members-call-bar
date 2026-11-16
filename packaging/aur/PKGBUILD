@@ -8,6 +8,11 @@
 #   2. Generate .SRCINFO, which the AUR requires next to this file:
 #        makepkg --printsrcinfo > .SRCINFO
 #   3. Commit PKGBUILD and .SRCINFO to ssh://aur@aur.archlinux.org/discord-voice-waybar.git
+#
+# Popup panel (`discord-voice popup`): it is behind the `popup` cargo
+# feature, off by default so the package needs no GTK. To build it, set
+# _popup=1 below (or `_popup=1 makepkg`); this adds gtk4 and gtk4-layer-shell
+# to depends/makedepends and passes `--features popup` to cargo.
 
 pkgname=discord-voice-waybar
 _name=members-call-bar
@@ -20,7 +25,15 @@ license=('MIT')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=('waybar: the bar that shows the slots'
-            'hyprland: default click-to-focus command (hyprctl)')
+            'hyprland: default click-to-focus command (hyprctl)'
+            'socat: read the local JSON API from scripts')
+: "${_popup:=0}"
+_features=()
+if [[ $_popup == 1 ]]; then
+  depends+=('gtk4' 'gtk4-layer-shell')
+  makedepends+=('pkgconf')
+  _features=(--features popup)
+fi
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -34,13 +47,13 @@ build() {
   cd "$_name-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release
+  cargo build --frozen --release "${_features[@]}"
 }
 
 check() {
   cd "$_name-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
-  cargo test --frozen
+  cargo test --frozen "${_features[@]}"
 }
 
 package() {

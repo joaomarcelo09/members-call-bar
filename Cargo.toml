@@ -10,9 +10,17 @@ publish = false
 name = "discord-voice"
 path = "src/main.rs"
 
+[features]
+default = []
+# GTK4 layer-shell popup (`discord-voice popup`); needs the gtk4 and
+# gtk4-layer-shell system libraries.
+popup = ["dep:gtk4", "dep:gtk4-layer-shell"]
+
 [dependencies]
 anyhow = "1"
 dirs = "6"
+gtk4 = { version = "0.11", optional = true }
+gtk4-layer-shell = { version = "0.8", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

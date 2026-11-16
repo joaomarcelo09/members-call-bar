@@ -18,6 +18,51 @@ pub const MIN_SIZE: u32 = 16;
 pub const MAX_SIZE: u32 = 512;
 pub const DEFAULT_SIGNAL_BASE: i32 = 8;
 pub const DEFAULT_FOCUS_COMMAND: &str = "hyprctl dispatch focuswindow class:discord";
+pub const DEFAULT_POPUP_MARGIN: i32 = 8;
+pub const MAX_POPUP_MARGIN: i32 = 4000;
+
+/// Screen corner the popup is placed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PopupAnchor {
+    TopLeft,
+    #[default]
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl PopupAnchor {
+    pub fn is_top(self) -> bool {
+        matches!(self, Self::TopLeft | Self::TopRight)
+    }
+
+    pub fn is_left(self) -> bool {
+        matches!(self, Self::TopLeft | Self::BottomLeft)
+    }
+}
+
+/// Popup placement: corner plus the distance to each screen edge (only the
+/// two edges of the corner are used).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopupSettings {
+    pub anchor: PopupAnchor,
+    pub margin_top: i32,
+    pub margin_right: i32,
+    pub margin_bottom: i32,
+    pub margin_left: i32,
+}
+
+impl Default for PopupSettings {
+    fn default() -> Self {
+        Self {
+            anchor: PopupAnchor::TopRight,
+            margin_top: DEFAULT_POPUP_MARGIN,
+            margin_right: DEFAULT_POPUP_MARGIN,
+            margin_bottom: DEFAULT_POPUP_MARGIN,
+            margin_left: DEFAULT_POPUP_MARGIN,
+        }
+    }
+}
 
 /// Order of the members after your own user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -42,6 +87,11 @@ pub struct Settings {
     pub sort: SortOrder,
     /// `focus_command`, already split into program and arguments.
     pub focus_command: Vec<String>,
+    /// Serve the local JSON API (`api`).
+    pub api: bool,
+    /// API socket; `None`: `$XDG_RUNTIME_DIR/discord-voice/api.sock`.
+    pub api_socket: Option<PathBuf>,
+    pub popup: PopupSettings,
 }
 
 impl Default for Settings {
@@ -55,6 +105,9 @@ impl Default for Settings {
             sort: SortOrder::Join,
             focus_command: focus::split_command(DEFAULT_FOCUS_COMMAND)
                 .expect("default focus command is valid"),
+            api: true,
+            api_socket: None,
+            popup: PopupSettings::default(),
         }
     }
 }
@@ -86,6 +139,13 @@ struct Raw {
     show_self: Option<bool>,
     sort: Option<String>,
     focus_command: Option<String>,
+    api: Option<bool>,
+    api_socket: Option<String>,
+    popup_anchor: Option<String>,
+    popup_margin_top: Option<i64>,
+    popup_margin_right: Option<i64>,
+    popup_margin_bottom: Option<i64>,
+    popup_margin_left: Option<i64>,
 }
 
 /// Parses and validates the optional settings of a `config.toml` text.
@@ -153,6 +213,57 @@ pub fn parse_settings(text: &str) -> Result<Settings> {
             bail!("`focus_command` must not be empty");
         }
         s.focus_command = argv;
+    }
+    if let Some(b) = raw.api {
+        s.api = b;
+    }
+    if let Some(p) = raw.api_socket {
+        let path = PathBuf::from(&p);
+        if !path.is_absolute() {
+            bail!("`api_socket` must be an absolute path, got {p:?}");
+        }
+        s.api_socket = Some(path);
+    }
+    if let Some(a) = &raw.popup_anchor {
+        s.popup.anchor = match a.as_str() {
+            "top-left" => PopupAnchor::TopLeft,
+            "top-right" => PopupAnchor::TopRight,
+            "bottom-left" => PopupAnchor::BottomLeft,
+            "bottom-right" => PopupAnchor::BottomRight,
+            other => bail!(
+                "`popup_anchor` must be \"top-left\", \"top-right\", \"bottom-left\" or \"bottom-right\", got {other:?}"
+            ),
+        };
+    }
+    let margins = [
+        (
+            "popup_margin_top",
+            raw.popup_margin_top,
+            &mut s.popup.margin_top,
+        ),
+        (
+            "popup_margin_right",
+            raw.popup_margin_right,
+            &mut s.popup.margin_right,
+        ),
+        (
+            "popup_margin_bottom",
+            raw.popup_margin_bottom,
+            &mut s.popup.margin_bottom,
+        ),
+        (
+            "popup_margin_left",
+            raw.popup_margin_left,
+            &mut s.popup.margin_left,
+        ),
+    ];
+    for (key, value, field) in margins {
+        if let Some(m) = value {
+            if !(0..=i64::from(MAX_POPUP_MARGIN)).contains(&m) {
+                bail!("`{key}` must be between 0 and {MAX_POPUP_MARGIN} pixels, got {m}");
+            }
+            *field = m as i32;
+        }
     }
     Ok(s)
 }
@@ -224,6 +335,10 @@ mod tests {
             s.focus_command,
             ["hyprctl", "dispatch", "focuswindow", "class:discord"]
         );
+        assert!(s.api);
+        assert_eq!(s.api_socket, None);
+        assert_eq!(s.popup.anchor, PopupAnchor::TopRight);
+        assert_eq!((s.popup.margin_top, s.popup.margin_right), (8, 8));
         // Settings do not need the credentials.
         assert_eq!(parse_settings("").unwrap(), Settings::default());
     }
@@ -241,6 +356,13 @@ socket_path = "/run/user/1000/discord-ipc-0"
 show_self = false
 sort = "speaking"
 focus_command = "swaymsg '[class=\"discord\"] focus'"
+api = false
+api_socket = "/tmp/dv/api.sock"
+popup_anchor = "bottom-left"
+popup_margin_top = 1
+popup_margin_right = 2
+popup_margin_bottom = 3
+popup_margin_left = 4
 "##,
         )
         .unwrap();
@@ -256,6 +378,19 @@ focus_command = "swaymsg '[class=\"discord\"] focus'"
         assert!(!s.show_self);
         assert_eq!(s.sort, SortOrder::Speaking);
         assert_eq!(s.focus_command, ["swaymsg", "[class=\"discord\"] focus"]);
+        assert!(!s.api);
+        assert_eq!(s.api_socket.as_deref(), Some(Path::new("/tmp/dv/api.sock")));
+        assert_eq!(
+            s.popup,
+            PopupSettings {
+                anchor: PopupAnchor::BottomLeft,
+                margin_top: 1,
+                margin_right: 2,
+                margin_bottom: 3,
+                margin_left: 4,
+            }
+        );
+        assert!(!s.popup.anchor.is_top() && s.popup.anchor.is_left());
         assert_eq!(
             parse("speaking_color = \"00ff00\"")
                 .unwrap()
@@ -280,6 +415,10 @@ focus_command = "swaymsg '[class=\"discord\"] focus'"
         assert!(err("focus_command = \"\"").contains("must not be empty"));
         assert!(err("focus_command = \"a 'b\"").contains("focus_command"));
         assert!(err("slots = \"5\"").contains("invalid config"));
+        assert!(err("api_socket = \"api.sock\"").contains("`api_socket` must be an absolute"));
+        assert!(err("popup_anchor = \"center\"").contains("`popup_anchor`"));
+        assert!(err("popup_margin_top = -1").contains("`popup_margin_top`"));
+        assert!(err("popup_margin_right = 5000").contains("`popup_margin_right`"));
         // Typos are reported.
         assert!(err("slot = 5").contains("unknown field `slot`"));
     }

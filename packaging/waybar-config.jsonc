@@ -9,7 +9,14 @@
 // With the default `slots = 5`, slots 0-4 show members and slot 5 is the
 // "+K" overflow badge (its tooltip lists the hidden members). For another
 // `slots` value, add or remove modules so there are `slots` + 1 of them.
-// Clicking any slot runs `focus_command` to raise the Discord window.
+//
+// Clicks: slot 0 (the first slot) toggles the popup panel with larger
+// avatars and live speaking state (`discord-voice popup toggle`, needs a
+// build with the `popup` feature; otherwise use `discord-voice focus` there
+// too). Right-click on slot 0 and a click on any other slot run
+// `focus_command` to raise the Discord window. Waybar has no hover action:
+// hovering a slot shows its tooltip. `exec-on-event` is off on slot 0 so a
+// click does not re-run `exec` (the daemon signals real changes anyway).
 {
   "modules-right": [
     "image#discord-voice-0",
@@ -24,7 +31,9 @@
     "signal": 8,
     "size": 24,
     "tooltip": true,
-    "on-click": "discord-voice focus"
+    "exec-on-event": false,
+    "on-click": "discord-voice popup toggle",
+    "on-click-right": "discord-voice focus"
   },
   "image#discord-voice-1": {
     "exec": "discord-voice slot 1",
