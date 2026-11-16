@@ -1,3 +1,6 @@
 .team
 .env
 /target
+/packaging/aur/src/
+/packaging/aur/pkg/
+/packaging/aur/*.tar.gz

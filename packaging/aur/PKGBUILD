@@ -24,6 +24,8 @@ url="https://github.com/joaomarcelo09/members-call-bar"
 license=('MIT')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
+# ring's C/asm objects fail to link under makepkg's default LTO flags.
+options=('!lto')
 optdepends=('waybar: the bar that shows the slots'
             'hyprland: default click-to-focus command (hyprctl)'
             'socat: read the local JSON API from scripts')
