@@ -84,7 +84,8 @@ pub async fn supervise<C: Connector>(
         let delay = backoff.next_delay();
         match &result {
             Ok(()) => tracing::warn!(?delay, "disconnected from Discord; reconnecting"),
-            Err(e) if !quiet => {
+            // Authorization failures stay visible: they repeat the prompt.
+            Err(e) if !quiet || format!("{e:#}").contains("AUTHORIZE") => {
                 tracing::warn!(error = %format!("{e:#}"), ?delay, "Discord connection failed; retrying")
             }
             Err(e) => tracing::debug!(error = %format!("{e:#}"), ?delay, "still not connected"),

@@ -232,11 +232,16 @@ impl RpcClient {
     }
 
     /// AUTHORIZE: prompts the user in the Discord client; returns the OAuth code.
-    pub async fn authorize(&mut self, client_id: &str, scopes: &[&str]) -> Result<String> {
+    pub async fn authorize(
+        &mut self,
+        client_id: &str,
+        scopes: &[&str],
+        redirect_uri: &str,
+    ) -> Result<String> {
         let data = self
             .command(
                 "AUTHORIZE",
-                json!({ "client_id": client_id, "scopes": scopes }),
+                authorize_args(client_id, scopes, redirect_uri),
                 None,
             )
             .await?;
@@ -303,6 +308,13 @@ impl RpcClient {
             }
         }
     }
+}
+
+/// Arguments of AUTHORIZE. Discord rejects the request with code 5000
+/// ("Missing redirect_uri") without `redirect_uri`, which must match the one
+/// used for the code exchange.
+pub fn authorize_args(client_id: &str, scopes: &[&str], redirect_uri: &str) -> Value {
+    json!({ "client_id": client_id, "scopes": scopes, "redirect_uri": redirect_uri })
 }
 
 /// Extracts `data.user` from an AUTHENTICATE reply without touching the
@@ -373,6 +385,14 @@ mod tests {
 
     fn v(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn authorize_args_include_redirect_uri() {
+        let args = authorize_args("123", &["rpc"], "http://localhost");
+        assert_eq!(args["redirect_uri"], "http://localhost");
+        assert_eq!(args["client_id"], "123");
+        assert_eq!(args["scopes"], json!(["rpc"]));
     }
 
     #[test]
