@@ -1,10 +1,18 @@
-//! `discord-voice`: prints voice events from the local Discord client.
+//! `discord-voice`: shows the members of the current Discord voice call in
+//! Waybar, using the local Discord client's RPC socket.
 
 mod auth;
 mod avatars;
+mod daemon;
 mod ipc;
+mod notify;
+mod output;
+mod render;
 mod rpc;
 mod state;
+
+use std::io::Write;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use serde_json::json;
@@ -16,18 +24,40 @@ use crate::avatars::{AvatarCache, Fetcher, HttpFetcher};
 use crate::rpc::{RpcClient, User, VoiceChannel, VoiceEvent, VoiceMember};
 use crate::state::{MemberState, Snapshot, StateTracker};
 
-const USAGE: &str = "usage: discord-voice [events|state]
+const USAGE: &str = "usage: discord-voice [events|state|run|slot <n>|status]
 
 Commands:
-  events   connect to Discord and print voice events (default)
-  state    track the call and print its state (members, flags, avatar
-           files) whenever it changes
+  events    connect to Discord and print voice events (default)
+  state     track the call and print its state (members, flags, avatar
+            files) whenever it changes
+  run       daemon: render call members into Waybar slot files
+            ($XDG_RUNTIME_DIR/discord-voice/) and signal Waybar
+  slot <n>  print slot n (0-4) for a Waybar `image` module: image path and
+            tooltip, or nothing when the slot is empty
+  status    tell whether the daemon runs and what call it shows
 
 Config: $XDG_CONFIG_HOME/discord-voice/config.toml (see README.md).
 Logging: set RUST_LOG (e.g. RUST_LOG=debug); logs go to stderr.";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Waybar runs `slot` on every refresh: no logging setup, no runtime.
+    match args.first().map(String::as_str) {
+        Some("slot") => {
+            print_slot(args.get(1).map(String::as_str));
+            return Ok(());
+        }
+        Some("status") => {
+            let report = match output::default_dir() {
+                Ok(dir) => output::status_report(&dir),
+                Err(_) => "not running".to_owned(),
+            };
+            println!("{report}");
+            return Ok(());
+        }
+        _ => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -35,10 +65,15 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async_main(args))
+}
+
+async fn async_main(args: Vec<String>) -> Result<()> {
     match args.first().map(String::as_str) {
         None | Some("events") => run_events().await,
         Some("state") => run_state().await,
+        Some("run") => run_daemon().await,
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -145,6 +180,55 @@ async fn run_state() -> Result<()> {
 
     let result = track(&mut rpc, &mut tracker).await;
     printer.abort();
+    result
+}
+
+/// `slot <n>`: prints the slot or nothing. Never fails, never blocks on
+/// anything but two small local files.
+fn print_slot(arg: Option<&str>) {
+    let text = arg
+        .and_then(|n| n.parse::<usize>().ok())
+        .zip(output::default_dir().ok())
+        .and_then(|(n, dir)| output::read_slot(&dir, n));
+    if let Some(text) = text {
+        // Ignore errors such as a closed pipe.
+        let _ = std::io::stdout().lock().write_all(text.as_bytes());
+    }
+}
+
+/// `run`: tracks the call and renders it into Waybar slot files until
+/// Ctrl-C/SIGTERM or an RPC error. Slots are emptied on exit either way.
+async fn run_daemon() -> Result<()> {
+    // Opening the writer also clears slots left by a crashed run.
+    let writer = output::SlotWriter::open(output::default_dir()?)?;
+    tracing::info!(dir = %writer.dir().display(), "writing Waybar slots");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    let (mut rpc, user) = connect().await?;
+    let (mut tracker, rx) = StateTracker::new();
+    tracker.set_own_user_id(user.id);
+
+    let cache = AvatarCache::new(avatars::default_cache_dir()?, HttpFetcher::new()?);
+    let notifier = notify::Notifier::spawn(notify::WaybarSignaler);
+    let renderer = tokio::spawn(daemon::run(rx, cache, writer, notifier));
+
+    let result = tokio::select! {
+        r = track(&mut rpc, &mut tracker) => r,
+        _ = sigterm.recv() => Ok(()),
+    };
+    match &result {
+        Ok(()) => tracing::info!("shutting down"),
+        Err(e) => tracing::error!(error = %e, "RPC error, shutting down"),
+    }
+    // Dropping the tracker closes the snapshot channel: the renderer clears
+    // the slots and exits.
+    drop(tracker);
+    if tokio::time::timeout(Duration::from_secs(2), renderer)
+        .await
+        .is_err()
+    {
+        tracing::warn!("renderer did not stop in time");
+    }
     result
 }
 

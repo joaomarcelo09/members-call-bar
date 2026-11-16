@@ -73,4 +73,35 @@ no redirects) and cached in `$XDG_CACHE_HOME/discord-voice/avatars/` as
 `<user id>_<avatar hash>.png`; cached files are never downloaded again. Users
 without an avatar, or whose download fails, get Discord's default avatar.
 
+## Waybar setup
+
+`discord-voice run` is the daemon: it tracks the call and renders up to 5
+members (you first) as 64x64 circular avatars with a green ring while
+speaking, dimmed while muted or deafened. Files live in
+`$XDG_RUNTIME_DIR/discord-voice/` (mode 0700): `slot<n>.png`, `slot<n>.txt`
+(tooltip) and `status`. Only changed slots are rewritten, and Waybar is told
+to refresh them with `SIGRTMIN+8+n` (changes coalesced for 50 ms, at most ~20
+signals per second). Slots are emptied when you leave the call or the daemon
+stops.
+
+1. Install the binary: `cargo install --path .` (to `~/.cargo/bin`).
+2. Run the daemon once in a terminal to approve the Discord prompt, then
+   install the systemd user unit:
+
+   ```sh
+   install -Dm644 packaging/discord-voice.service ~/.config/systemd/user/discord-voice.service
+   systemctl --user daemon-reload
+   systemctl --user enable --now discord-voice.service
+   ```
+
+3. Add the five `image#discord-voice-N` modules from
+   [`packaging/waybar-config.jsonc`](packaging/waybar-config.jsonc) to your
+   Waybar config (optionally the CSS in
+   [`packaging/waybar-style.css`](packaging/waybar-style.css)) and reload
+   Waybar. Each module runs `discord-voice slot N`, which prints the image
+   path and tooltip, or nothing when the slot is empty (the module is hidden).
+   Keep `signal` at `8 + N`; no `interval` is needed.
+
+`discord-voice status` tells whether the daemon runs and which call it shows.
+
 Secrets and tokens are never logged. No telemetry.

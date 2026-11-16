@@ -1,0 +1,46 @@
+// Sample Waybar modules for discord-voice (merge into ~/.config/waybar/config.jsonc).
+//
+// Uses Waybar's `image` module type (custom modules cannot show images). Each
+// module shows one call member. The `discord-voice run` daemon writes the
+// slot files and sends SIGRTMIN+<signal> to Waybar when a slot changes, so no
+// polling `interval` is needed. Slot n uses signal 8+n (notify::SIGNAL_BASE).
+// An empty slot prints nothing, which hides the module outside a call.
+{
+  "modules-right": [
+    "image#discord-voice-0",
+    "image#discord-voice-1",
+    "image#discord-voice-2",
+    "image#discord-voice-3",
+    "image#discord-voice-4"
+  ],
+  "image#discord-voice-0": {
+    "exec": "discord-voice slot 0",
+    "signal": 8,
+    "size": 24,
+    "tooltip": true
+  },
+  "image#discord-voice-1": {
+    "exec": "discord-voice slot 1",
+    "signal": 9,
+    "size": 24,
+    "tooltip": true
+  },
+  "image#discord-voice-2": {
+    "exec": "discord-voice slot 2",
+    "signal": 10,
+    "size": 24,
+    "tooltip": true
+  },
+  "image#discord-voice-3": {
+    "exec": "discord-voice slot 3",
+    "signal": 11,
+    "size": 24,
+    "tooltip": true
+  },
+  "image#discord-voice-4": {
+    "exec": "discord-voice slot 4",
+    "signal": 12,
+    "size": 24,
+    "tooltip": true
+  }
+}

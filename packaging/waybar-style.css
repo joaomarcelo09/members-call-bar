@@ -1,0 +1,8 @@
+/* Sample style for discord-voice slots (append to ~/.config/waybar/style.css). */
+#image.discord-voice-0,
+#image.discord-voice-1,
+#image.discord-voice-2,
+#image.discord-voice-3,
+#image.discord-voice-4 {
+  padding: 0 2px;
+}
