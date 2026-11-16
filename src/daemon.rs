@@ -3,6 +3,9 @@
 //! Avatars are resolved by a separate task, so a speaking-ring change never
 //! waits on a download: members whose avatar is not loaded yet are drawn
 //! with a placeholder and redrawn when it arrives.
+//!
+//! The renderer lives as long as the daemon, across reconnects: the `link`
+//! channel tells whether Discord is connected (written to the status file).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,8 +13,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
 use crate::avatars::{AvatarCache, Fetcher};
+use crate::config::Settings;
+use crate::layout;
 use crate::notify::{self, Notifier};
-use crate::output::{self, SlotView, SlotWriter, Status, SLOTS};
+use crate::output::{self, SlotContent, SlotView, SlotWriter, Status};
 use crate::render::{self, Style};
 use crate::state::{MemberState, Snapshot};
 
@@ -36,13 +41,15 @@ struct LoadedAvatar {
     loading: bool,
 }
 
-/// Renders snapshots until the snapshot sender is dropped, then empties
-/// every slot, signals Waybar and removes the status file.
+/// Renders snapshots until the snapshot or link sender is dropped, then
+/// empties every slot, signals Waybar and removes the status file.
 pub async fn run<F>(
     mut rx: watch::Receiver<Snapshot>,
+    mut link: watch::Receiver<bool>,
     cache: AvatarCache<F>,
     writer: SlotWriter,
     notifier: Notifier,
+    settings: Settings,
 ) where
     F: Fetcher + Send + Sync + 'static,
 {
@@ -50,7 +57,8 @@ pub async fn run<F>(
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
     let resolver = tokio::spawn(resolve_avatars(cache, req_rx, reply_tx));
 
-    let mut renderer = Renderer::new(writer, req_tx, notifier);
+    let mut renderer = Renderer::new(writer, req_tx, notifier, settings);
+    renderer.connected = *link.borrow_and_update();
     renderer.set_snapshot(rx.borrow_and_update().clone());
     loop {
         tokio::select! {
@@ -59,6 +67,13 @@ pub async fn run<F>(
                     break;
                 }
                 renderer.set_snapshot(rx.borrow_and_update().clone());
+            }
+            changed = link.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                renderer.connected = *link.borrow_and_update();
+                renderer.sync();
             }
             Some(reply) = reply_rx.recv() => renderer.avatar_loaded(reply),
         }
@@ -96,10 +111,16 @@ struct Renderer {
     writer: SlotWriter,
     requests: mpsc::UnboundedSender<AvatarRequest>,
     notifier: Notifier,
+    settings: Settings,
     avatars: HashMap<String, LoadedAvatar>,
     status: Option<Status>,
+    connected: bool,
     /// Last snapshot, re-rendered when an avatar arrives.
     snap: Snapshot,
+    /// Snapshot counter, the clock of `last_spoke`.
+    tick: u64,
+    /// Tick of the last snapshot in which each member was speaking.
+    last_spoke: HashMap<String, u64>,
 }
 
 impl Renderer {
@@ -107,18 +128,29 @@ impl Renderer {
         writer: SlotWriter,
         requests: mpsc::UnboundedSender<AvatarRequest>,
         notifier: Notifier,
+        settings: Settings,
     ) -> Self {
         Self {
             writer,
             requests,
             notifier,
+            settings,
             avatars: HashMap::new(),
             status: None,
+            connected: false,
             snap: Snapshot::default(),
+            tick: 0,
+            last_spoke: HashMap::new(),
         }
     }
 
     fn set_snapshot(&mut self, snap: Snapshot) {
+        self.tick += 1;
+        self.last_spoke
+            .retain(|id, _| snap.members.iter().any(|m| &m.user_id == id));
+        for m in snap.members.iter().filter(|m| m.speaking) {
+            self.last_spoke.insert(m.user_id.clone(), self.tick);
+        }
         self.snap = snap;
         self.sync();
     }
@@ -131,22 +163,53 @@ impl Renderer {
             // Do not keep avatar bytes around outside a call.
             self.avatars.retain(|_, a| a.loading);
         }
-        for slot in 0..SLOTS {
-            let view = snap.members.get(slot).map(|m| self.view(&snap, m));
+        let slots = self.settings.slots;
+        let assignment = layout::assign(
+            &snap.members,
+            snap.own_user_id.as_deref(),
+            self.settings.show_self,
+            self.settings.sort,
+            &self.last_spoke,
+            slots,
+        );
+        let mut contents: Vec<Option<SlotContent>> = Vec::with_capacity(slots + 1);
+        for slot in 0..slots {
+            let content = assignment
+                .shown
+                .get(slot)
+                .map(|&i| SlotContent::Member(self.view(&snap, &snap.members[i])));
+            contents.push(content);
+        }
+        contents.push((!assignment.hidden.is_empty()).then(|| {
+            SlotContent::Overflow {
+                hidden: assignment
+                    .hidden
+                    .iter()
+                    .map(|&i| snap.members[i].name.clone())
+                    .collect(),
+            }
+        }));
+
+        let cfg = self.settings.render;
+        for (slot, content) in contents.iter().enumerate() {
             let avatars = &self.avatars;
-            let result = self.writer.update(slot, view.as_ref(), |v| {
-                let bytes = avatars.get(&v.user_id).and_then(|a| a.bytes.as_deref());
-                render::render_slot(
-                    bytes,
-                    Style {
-                        speaking: v.speaking,
-                        dimmed: v.muted || v.deafened,
-                    },
-                )
+            let result = self.writer.update(slot, content.as_ref(), |c| match c {
+                SlotContent::Member(v) => {
+                    let bytes = avatars.get(&v.user_id).and_then(|a| a.bytes.as_deref());
+                    render::render_slot(
+                        bytes,
+                        Style {
+                            speaking: v.speaking,
+                            dimmed: v.muted || v.deafened,
+                        },
+                        &cfg,
+                    )
+                }
+                SlotContent::Overflow { hidden } => render::render_overflow(hidden.len(), &cfg),
             });
             match result {
                 Ok(true) => {
-                    tracing::debug!(slot, view = ?view, "slot updated");
+                    tracing::debug!(slot, view = ?content, "slot updated");
                     self.notifier.notify(slot);
                 }
                 Ok(false) => {}
@@ -210,7 +273,7 @@ impl Renderer {
     fn write_status(&mut self, snap: &Snapshot) {
         let status = Status {
             pid: std::process::id(),
-            connected: true,
+            connected: self.connected,
             channel: snap
                 .channel
                 .as_ref()
@@ -223,6 +286,7 @@ impl Renderer {
         match output::write_status(self.writer.dir(), &status) {
             Ok(()) => {
                 tracing::info!(
+                    connected = status.connected,
                     channel = status.channel.as_deref().unwrap_or("-"),
                     members = status.members,
                     "call state"
@@ -236,7 +300,7 @@ impl Renderer {
     fn shutdown(&mut self) {
         let cleared = self.writer.clear_all();
         if !cleared.is_empty() {
-            notify::signal_waybar(&cleared);
+            notify::signal_waybar(self.settings.signal_base, &cleared);
         }
         if let Err(e) = output::remove_status(self.writer.dir()) {
             tracing::warn!(error = %e, "cannot remove status file");
@@ -312,10 +376,19 @@ mod tests {
             std::env::temp_dir().join(format!("discord-voice-daemon-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let out = base.join("out");
-        let writer = SlotWriter::open(out.clone()).unwrap();
+        let settings = Settings::default();
+        let writer = SlotWriter::open(out.clone(), settings.slot_files()).unwrap();
         let cache = AvatarCache::new(base.join("avatars"), StuckFetcher);
         let (tx, rx) = watch::channel(Snapshot::default());
-        let task = tokio::spawn(run(rx, cache, writer, Notifier::spawn(NoSignals)));
+        let (_link_tx, link_rx) = watch::channel(true);
+        let task = tokio::spawn(run(
+            rx,
+            link_rx,
+            cache,
+            writer,
+            Notifier::spawn(NoSignals),
+            settings,
+        ));
 
         tx.send(snapshot(vec![member("1", false), member("2", false)]))
             .unwrap();
@@ -352,6 +425,82 @@ mod tests {
         wait_for(output::txt_path(&out, 0), "user1 (you) · speaking").await;
 
         // Exit clears slots and the status file.
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn overflow_slot_hides_extra_members_and_link_state_is_reported() {
+        let base = std::env::temp_dir().join(format!(
+            "discord-voice-daemon-overflow-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let out = base.join("out");
+        let settings = Settings {
+            slots: 2,
+            show_self: false,
+            ..Settings::default()
+        };
+        let writer = SlotWriter::open(out.clone(), settings.slot_files()).unwrap();
+        let cache = AvatarCache::new(base.join("avatars"), StuckFetcher);
+        let (tx, rx) = watch::channel(Snapshot::default());
+        let (link_tx, link_rx) = watch::channel(true);
+        let task = tokio::spawn(run(
+            rx,
+            link_rx,
+            cache,
+            writer,
+            Notifier::spawn(NoSignals),
+            settings,
+        ));
+
+        let ids = ["1", "2", "3", "4", "5"];
+        tx.send(snapshot(ids.iter().map(|id| member(id, false)).collect()))
+            .unwrap();
+        // Own user ("1") is excluded; two member slots, then the badge.
+        wait_for(output::txt_path(&out, 0), "user2").await;
+        wait_for(output::txt_path(&out, 1), "user3").await;
+        wait_for(output::txt_path(&out, 2), "Also in the call: user4, user5").await;
+        assert!(output::png_path(&out, 2).is_file());
+        assert!(!output::txt_path(&out, 3).exists());
+
+        // Fewer members: the badge goes away.
+        tx.send(snapshot(vec![
+            member("1", false),
+            member("2", false),
+            member("3", false),
+        ]))
+        .unwrap();
+        for _ in 0..200 {
+            if !output::txt_path(&out, 2).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!output::png_path(&out, 2).exists());
+
+        // Disconnected: status says so.
+        link_tx.send_replace(false);
+        tx.send(Arc::new(SnapshotData::default())).unwrap();
+        wait_for(
+            output::status_path(&out),
+            &Status {
+                pid: std::process::id(),
+                connected: false,
+                channel: None,
+                members: 0,
+            }
+            .to_text(),
+        )
+        .await;
+        assert!(!output::txt_path(&out, 0).exists());
+
         drop(tx);
         tokio::time::timeout(Duration::from_secs(2), task)
             .await

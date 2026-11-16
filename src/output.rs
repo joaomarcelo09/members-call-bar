@@ -1,8 +1,9 @@
 //! Files read by Waybar: `$XDG_RUNTIME_DIR/discord-voice/`.
 //!
-//! For each slot `n` in `0..SLOTS` the daemon writes `slot<n>.png` (the
-//! rendered avatar) and `slot<n>.txt` (the one-line tooltip). An empty slot
-//! has neither file. A `status` file describes the running daemon. Every
+//! For each slot `n` the daemon writes `slot<n>.png` (the rendered avatar,
+//! or the `+K` overflow badge) and `slot<n>.txt` (the one-line tooltip). An
+//! empty slot has neither file. Slots `0..slots` show members, slot `slots`
+//! is the overflow slot. A `status` file describes the running daemon. Every
 //! write is atomic (temp file + rename), so readers never see partial files.
 
 use std::fs;
@@ -12,8 +13,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
-/// Number of member slots shown in Waybar.
-pub const SLOTS: usize = 5;
+use crate::config::MAX_SLOTS;
+
+/// Upper bound for slot indices: the most member slots plus the overflow
+/// slot. `slot <n>` and stale-file cleanup use it, so neither needs the
+/// config.
+pub const MAX_SLOT_FILES: usize = MAX_SLOTS + 1;
 
 /// `$XDG_RUNTIME_DIR/discord-voice`.
 pub fn default_dir() -> Result<PathBuf> {
@@ -49,11 +54,33 @@ pub struct SlotView {
     pub avatar_loaded: bool,
 }
 
-/// One-line tooltip, e.g. `Mason (you) · muted · speaking`. Waybar parses
-/// tooltips as Pango markup, so the name is escaped.
-pub fn tooltip(view: &SlotView) -> String {
-    let mut out = String::with_capacity(view.name.len() + 16);
-    for c in view.name.chars() {
+/// What a slot shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotContent {
+    Member(SlotView),
+    /// Members that did not fit, by name.
+    Overflow {
+        hidden: Vec<String>,
+    },
+}
+
+impl SlotContent {
+    pub fn tooltip(&self) -> String {
+        match self {
+            SlotContent::Member(v) => tooltip(v),
+            SlotContent::Overflow { hidden } => {
+                let names: Vec<String> = hidden.iter().map(|n| escape(n)).collect();
+                format!("Also in the call: {}", names.join(", "))
+            }
+        }
+    }
+}
+
+/// Escapes Pango markup and replaces control characters (newlines would
+/// split the one-line tooltip).
+fn escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -62,6 +89,13 @@ pub fn tooltip(view: &SlotView) -> String {
             c => out.push(c),
         }
     }
+    out
+}
+
+/// One-line tooltip, e.g. `Mason (you) · muted · speaking`. Waybar parses
+/// tooltips as Pango markup, so the name is escaped.
+pub fn tooltip(view: &SlotView) -> String {
+    let mut out = escape(&view.name);
     if view.own {
         out.push_str(" (you)");
     }
@@ -81,13 +115,15 @@ pub fn tooltip(view: &SlotView) -> String {
 /// Writes slot files, skipping slots whose view did not change.
 pub struct SlotWriter {
     dir: PathBuf,
-    last: [Option<SlotView>; SLOTS],
+    /// One entry per slot in use.
+    last: Vec<Option<SlotContent>>,
 }
 
 impl SlotWriter {
     /// Creates the directory (mode 0700) and removes stale slot files left
-    /// by a previous run.
-    pub fn open(dir: PathBuf) -> Result<Self> {
+    /// by a previous run (with any slot count). Uses slots `0..count`
+    /// (at most [`MAX_SLOT_FILES`]).
+    pub fn open(dir: PathBuf, count: usize) -> Result<Self> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -97,7 +133,7 @@ impl SlotWriter {
             .with_context(|| format!("cannot set permissions on {}", dir.display()))?;
         let mut writer = Self {
             dir,
-            last: Default::default(),
+            last: vec![None; count.min(MAX_SLOT_FILES)],
         };
         writer.clear_all();
         Ok(writer)
@@ -113,10 +149,10 @@ impl SlotWriter {
     pub fn update(
         &mut self,
         slot: usize,
-        view: Option<&SlotView>,
-        render: impl FnOnce(&SlotView) -> Vec<u8>,
+        view: Option<&SlotContent>,
+        render: impl FnOnce(&SlotContent) -> Vec<u8>,
     ) -> io::Result<bool> {
-        if slot >= SLOTS || self.last[slot].as_ref() == view {
+        if slot >= self.last.len() || self.last[slot].as_ref() == view {
             return Ok(false);
         }
         // Forget the old state first: on error the slot is retried next time.
@@ -125,7 +161,7 @@ impl SlotWriter {
             Some(v) => {
                 // PNG first: a reader that finds the tooltip finds the image.
                 write_atomic(&png_path(&self.dir, slot), &render(v))?;
-                write_atomic(&txt_path(&self.dir, slot), tooltip(v).as_bytes())?;
+                write_atomic(&txt_path(&self.dir, slot), v.tooltip().as_bytes())?;
                 self.last[slot] = Some(v.clone());
             }
             None => remove_slot(&self.dir, slot)?,
@@ -136,8 +172,8 @@ impl SlotWriter {
     /// Empties every slot; returns the slots that were not empty.
     pub fn clear_all(&mut self) -> Vec<usize> {
         let mut changed = Vec::new();
-        for slot in 0..SLOTS {
-            let had = self.last[slot].take().is_some();
+        for slot in 0..MAX_SLOT_FILES {
+            let had = self.last.get_mut(slot).and_then(Option::take).is_some();
             let existed = txt_path(&self.dir, slot).exists() || png_path(&self.dir, slot).exists();
             if let Err(e) = remove_slot(&self.dir, slot) {
                 tracing::warn!(slot, error = %e, "cannot remove slot files");
@@ -182,7 +218,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// What `discord-voice slot <n>` prints: `<png path>\n<tooltip>\n`, or
 /// `None` if the slot is empty or anything fails.
 pub fn read_slot(dir: &Path, slot: usize) -> Option<String> {
-    if slot >= SLOTS {
+    if slot >= MAX_SLOT_FILES {
         return None;
     }
     let tooltip = fs::read_to_string(txt_path(dir, slot)).ok()?;
@@ -308,7 +344,11 @@ mod tests {
         }
     }
 
-    fn view(name: &str) -> SlotView {
+    fn view(name: &str) -> SlotContent {
+        SlotContent::Member(member_view(name))
+    }
+
+    fn member_view(name: &str) -> SlotView {
         SlotView {
             user_id: "1".into(),
             name: name.into(),
@@ -323,16 +363,20 @@ mod tests {
 
     #[test]
     fn tooltip_lists_state() {
-        assert_eq!(tooltip(&view("Mason")), "Mason");
+        assert_eq!(tooltip(&member_view("Mason")), "Mason");
         let v = SlotView {
             own: true,
             muted: true,
             deafened: true,
             speaking: true,
-            ..view("A\nB")
+            ..member_view("A\nB")
         };
         assert_eq!(tooltip(&v), "A B (you) · muted · deafened · speaking");
-        assert_eq!(tooltip(&view("<b>&")), "&lt;b&gt;&amp;");
+        assert_eq!(tooltip(&member_view("<b>&")), "&lt;b&gt;&amp;");
+        let overflow = SlotContent::Overflow {
+            hidden: vec!["Ann".into(), "<Bo>\n".into()],
+        };
+        assert_eq!(overflow.tooltip(), "Also in the call: Ann, &lt;Bo&gt; ");
     }
 
     #[test]
@@ -342,19 +386,21 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(txt_path(&dir, 2), "old").unwrap();
         fs::write(png_path(&dir, 2), "old").unwrap();
-        let w = SlotWriter::open(dir.clone()).unwrap();
+        fs::write(txt_path(&dir, MAX_SLOT_FILES - 1), "old").unwrap();
+        let w = SlotWriter::open(dir.clone(), 2).unwrap();
         let mode = fs::metadata(w.dir()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         assert!(!txt_path(&dir, 2).exists());
         assert!(!png_path(&dir, 2).exists());
+        assert!(!txt_path(&dir, MAX_SLOT_FILES - 1).exists());
     }
 
     #[test]
     fn writes_only_changed_slots_and_empties() {
         let tmp = TmpDir::new("update");
-        let mut w = SlotWriter::open(tmp.0.clone()).unwrap();
+        let mut w = SlotWriter::open(tmp.0.clone(), 5).unwrap();
         let renders = Cell::new(0);
-        let render = |_: &SlotView| {
+        let render = |_: &SlotContent| {
             renders.set(renders.get() + 1);
             b"png".to_vec()
         };
@@ -372,10 +418,10 @@ mod tests {
         assert!(!w.update(0, Some(&view("A")), render).unwrap());
         assert_eq!(renders.get(), 1);
 
-        let speaking = SlotView {
+        let speaking = SlotContent::Member(SlotView {
             speaking: true,
-            ..view("A")
-        };
+            ..member_view("A")
+        });
         assert!(w.update(0, Some(&speaking), render).unwrap());
         assert_eq!(renders.get(), 2);
         assert_eq!(
@@ -390,7 +436,18 @@ mod tests {
         assert!(!w.update(0, None, render).unwrap());
 
         // Out of range is ignored.
-        assert!(!w.update(SLOTS, Some(&view("A")), render).unwrap());
+        assert!(!w.update(5, Some(&view("A")), render).unwrap());
+
+        // The overflow badge is a slot like any other.
+        let more = SlotContent::Overflow {
+            hidden: vec!["B".into()],
+        };
+        assert!(w.update(4, Some(&more), render).unwrap());
+        assert_eq!(
+            read_slot(&tmp.0, 4).unwrap(),
+            format!("{}\nAlso in the call: B\n", png_path(&tmp.0, 4).display())
+        );
+        assert!(w.update(4, None, render).unwrap());
         // No temp files left behind.
         assert_eq!(fs::read_dir(&tmp.0).unwrap().count(), 0);
     }
@@ -398,7 +455,7 @@ mod tests {
     #[test]
     fn clear_all_reports_non_empty_slots() {
         let tmp = TmpDir::new("clear");
-        let mut w = SlotWriter::open(tmp.0.clone()).unwrap();
+        let mut w = SlotWriter::open(tmp.0.clone(), 5).unwrap();
         w.update(1, Some(&view("A")), |_| vec![1]).unwrap();
         w.update(3, Some(&view("B")), |_| vec![1]).unwrap();
         assert_eq!(w.clear_all(), vec![1, 3]);
@@ -415,7 +472,7 @@ mod tests {
         assert_eq!(read_slot(&tmp.0, 0), None); // no png
         fs::write(png_path(&tmp.0, 0), "png").unwrap();
         assert!(read_slot(&tmp.0, 0).is_some());
-        assert_eq!(read_slot(&tmp.0, SLOTS), None);
+        assert_eq!(read_slot(&tmp.0, MAX_SLOT_FILES), None);
         fs::write(txt_path(&tmp.0, 0), "").unwrap();
         assert_eq!(read_slot(&tmp.0, 0), None); // empty tooltip
     }
