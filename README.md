@@ -182,7 +182,8 @@ back within seconds of Discord starting again. `discord-voice status` shows
    config (optionally the CSS in
    [`packaging/waybar-style.css`](packaging/waybar-style.css)) and reload
    Waybar. Each module runs `discord-voice slot N`, which prints the image
-   path and tooltip, or nothing when the slot is empty (the module is hidden).
+   path and tooltip, or the path of a 1x1 transparent image when the slot is
+   empty (Waybar needs a valid image path; `empty.png` in the runtime dir).
    Keep `signal` at `signal_base + N`; no `interval` is needed. With a
    non-default `slots`, use `slots + 1` modules (the last one is the overflow
    badge).

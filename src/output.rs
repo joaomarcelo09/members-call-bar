@@ -5,6 +5,8 @@
 //! empty slot has neither file. Slots `0..slots` show members, slot `slots`
 //! is the overflow slot. A `status` file describes the running daemon. Every
 //! write is atomic (temp file + rename), so readers never see partial files.
+//! `discord-voice slot <n>` itself may write `empty.png` (a 1x1 transparent
+//! image it prints for empty slots); the daemon leaves it alone.
 
 use std::fs;
 use std::io::{self, Write};
@@ -230,6 +232,104 @@ pub fn read_slot(dir: &Path, slot: usize) -> Option<String> {
     Some(format!("{}\n{}\n", png.display(), tooltip))
 }
 
+/// A 1x1 fully transparent PNG (RGBA), printed for empty slots: Waybar's
+/// `image` module needs a valid image path, an empty output breaks the bar.
+pub const EMPTY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x00, 0x02, 0x00,
+    0x00, 0x05, 0x00, 0x01, 0xe9, 0xfa, 0xdc, 0xd8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
+
+pub fn empty_png_path(dir: &Path) -> PathBuf {
+    dir.join("empty.png")
+}
+
+/// Where the empty-slot image may live, in order of preference:
+/// `<dir>/empty.png` (`dir` is created with mode 0700), then a per-user file
+/// directly in `$XDG_RUNTIME_DIR` and in the temp dir.
+pub fn empty_png_candidates(dir: Option<&Path>) -> Vec<(PathBuf, bool)> {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut out = Vec::new();
+    if let Some(dir) = dir {
+        out.push((empty_png_path(dir), true));
+    }
+    if let Some(runtime) = dirs::runtime_dir() {
+        out.push((runtime.join("discord-voice-empty.png"), false));
+    }
+    out.push((
+        std::env::temp_dir().join(format!("discord-voice-empty-{uid}.png")),
+        false,
+    ));
+    out
+}
+
+/// Returns the first candidate (see [`empty_png_candidates`]) that holds
+/// [`EMPTY_PNG`], writing it atomically where missing. `bool` tells whether
+/// to create the parent directory. `None` if every candidate fails; never
+/// panics.
+pub fn ensure_empty_png(candidates: &[(PathBuf, bool)]) -> Option<PathBuf> {
+    candidates.iter().find_map(|(path, create_dir)| {
+        if is_own_empty_png(path) {
+            return Some(path.clone());
+        }
+        if *create_dir {
+            let parent = path.parent()?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .ok()?;
+        }
+        write_new_atomic(path, EMPTY_PNG).ok()?;
+        Some(path.clone())
+    })
+}
+
+/// Whether `path` is a regular file (not a symlink) owned by this user that
+/// holds exactly [`EMPTY_PNG`].
+fn is_own_empty_png(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && m.uid() == uid && m.len() == EMPTY_PNG.len() as u64 => {
+            fs::read(path).is_ok_and(|b| b == EMPTY_PNG)
+        }
+        _ => false,
+    }
+}
+
+/// Like [`write_atomic`], but the temp file must not exist yet (it is
+/// never followed through a symlink, which matters in shared temp dirs).
+fn write_new_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("path has no file name"))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    let _ = remove_if_exists(&tmp);
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// What `discord-voice slot <n>` prints for an empty slot: the path of a
+/// transparent image and a newline (no tooltip). `None` only if no
+/// candidate is writable.
+pub fn empty_slot_text(dir: Option<&Path>) -> Option<String> {
+    ensure_empty_png(&empty_png_candidates(dir)).map(|p| format!("{}\n", p.display()))
+}
+
 /// Daemon status, stored as `key=value` lines in the `status` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
@@ -387,7 +487,9 @@ mod tests {
         fs::write(txt_path(&dir, 2), "old").unwrap();
         fs::write(png_path(&dir, 2), "old").unwrap();
         fs::write(txt_path(&dir, MAX_SLOT_FILES - 1), "old").unwrap();
+        fs::write(empty_png_path(&dir), EMPTY_PNG).unwrap();
         let w = SlotWriter::open(dir.clone(), 2).unwrap();
+        assert_eq!(fs::read(empty_png_path(&dir)).unwrap(), EMPTY_PNG);
         let mode = fs::metadata(w.dir()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         assert!(!txt_path(&dir, 2).exists());
@@ -461,6 +563,46 @@ mod tests {
         assert_eq!(w.clear_all(), vec![1, 3]);
         assert_eq!(fs::read_dir(&tmp.0).unwrap().count(), 0);
         assert!(w.clear_all().is_empty());
+    }
+
+    #[test]
+    fn empty_png_is_a_transparent_pixel() {
+        let img = image::load_from_memory(EMPTY_PNG).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (1, 1));
+        assert_eq!(img.get_pixel(0, 0).0[3], 0);
+    }
+
+    #[test]
+    fn empty_slot_writes_and_reuses_the_image() {
+        let tmp = TmpDir::new("empty");
+        let dir = tmp.0.join("discord-voice");
+        let text = empty_slot_text(Some(&dir)).unwrap();
+        let path = empty_png_path(&dir);
+        assert_eq!(text, format!("{}\n", path.display()));
+        assert_eq!(fs::read(&path).unwrap(), EMPTY_PNG);
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // An existing correct file is reused; a wrong one is replaced.
+        assert_eq!(empty_slot_text(Some(&dir)).unwrap(), text);
+        fs::write(&path, "junk").unwrap();
+        assert_eq!(empty_slot_text(Some(&dir)).unwrap(), text);
+        assert_eq!(fs::read(&path).unwrap(), EMPTY_PNG);
+        // No leftover temp files.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn empty_png_falls_back_when_dir_is_unusable() {
+        let tmp = TmpDir::new("empty-fallback");
+        fs::create_dir_all(&tmp.0).unwrap();
+        // A file where the directory should be: creating it fails.
+        let blocked = tmp.0.join("blocked");
+        fs::write(&blocked, "x").unwrap();
+        let fallback = tmp.0.join("fallback.png");
+        let got = ensure_empty_png(&[(empty_png_path(&blocked), true), (fallback.clone(), false)]);
+        assert_eq!(got, Some(fallback.clone()));
+        assert_eq!(fs::read(&fallback).unwrap(), EMPTY_PNG);
+        assert_eq!(ensure_empty_png(&[(empty_png_path(&blocked), true)]), None);
     }
 
     #[test]
