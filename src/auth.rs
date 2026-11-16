@@ -251,7 +251,7 @@ async fn refresh(cfg: &Config, token: &Token) -> Result<Token> {
 
 async fn authorize(rpc: &mut RpcClient, cfg: &Config) -> Result<Token> {
     tracing::info!("requesting authorization: approve the prompt in the Discord client");
-    let code = rpc.authorize(&cfg.client_id, SCOPES).await?;
+    let code = rpc.authorize(&cfg.client_id, SCOPES, &cfg.redirect_uri).await?;
     exchange_code(cfg, &code).await
 }
 
