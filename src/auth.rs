@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::rpc::RpcClient;
+use crate::rpc::{RpcClient, User};
 
 pub const SCOPES: &[&str] = &["rpc", "rpc.voice.read"];
 const TOKEN_URL: &str = "https://discord.com/api/oauth2/token";
@@ -216,12 +216,13 @@ async fn authorize(rpc: &mut RpcClient, cfg: &Config) -> Result<Token> {
 }
 
 /// Authenticates the RPC session: stored token, then refresh, then a fresh
-/// AUTHORIZE as the last resort. Persists any new token.
-pub async fn authenticate(rpc: &mut RpcClient, cfg: &Config, token_path: &Path) -> Result<()> {
+/// AUTHORIZE as the last resort. Persists any new token. Returns the
+/// authenticated user.
+pub async fn authenticate(rpc: &mut RpcClient, cfg: &Config, token_path: &Path) -> Result<User> {
     if let Some(token) = load_token(token_path) {
         if !token.is_expired(now_secs()) {
             match rpc.authenticate(&token.access_token).await {
-                Ok(()) => return Ok(()),
+                Ok(user) => return Ok(user),
                 Err(e) => tracing::warn!(error = %e, "stored token rejected; refreshing"),
             }
         }
@@ -229,7 +230,7 @@ pub async fn authenticate(rpc: &mut RpcClient, cfg: &Config, token_path: &Path) 
             Ok(new) => {
                 save_token(token_path, &new)?;
                 match rpc.authenticate(&new.access_token).await {
-                    Ok(()) => return Ok(()),
+                    Ok(user) => return Ok(user),
                     Err(e) => tracing::warn!(error = %e, "refreshed token rejected"),
                 }
             }

@@ -28,6 +28,12 @@ pub struct User {
     pub username: Option<String>,
     #[serde(default)]
     pub global_name: Option<String>,
+    /// Avatar hash, `None` when the user uses a default avatar.
+    #[serde(default)]
+    pub avatar: Option<String>,
+    /// Legacy discriminator (`"0"` for migrated usernames).
+    #[serde(default)]
+    pub discriminator: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -240,16 +246,17 @@ impl RpcClient {
             .ok_or_else(|| anyhow!("AUTHORIZE reply has no code"))
     }
 
-    /// AUTHENTICATE with an access token. The reply is not returned because it
-    /// echoes the token back.
-    pub async fn authenticate(&mut self, access_token: &str) -> Result<()> {
-        self.command(
-            "AUTHENTICATE",
-            json!({ "access_token": access_token }),
-            None,
-        )
-        .await?;
-        Ok(())
+    /// AUTHENTICATE with an access token. Returns only the authenticated user:
+    /// the rest of the reply is dropped because it echoes the token back.
+    pub async fn authenticate(&mut self, access_token: &str) -> Result<User> {
+        let data = self
+            .command(
+                "AUTHENTICATE",
+                json!({ "access_token": access_token }),
+                None,
+            )
+            .await?;
+        parse_authenticated_user(&data)
     }
 
     pub async fn subscribe(&mut self, evt: &str, args: Value) -> Result<()> {
@@ -296,6 +303,16 @@ impl RpcClient {
             }
         }
     }
+}
+
+/// Extracts `data.user` from an AUTHENTICATE reply without touching the
+/// token fields.
+pub fn parse_authenticated_user(data: &Value) -> Result<User> {
+    let user = data
+        .get("user")
+        .cloned()
+        .ok_or_else(|| anyhow!("AUTHENTICATE reply has no user"))?;
+    serde_json::from_value(user).context("malformed user in AUTHENTICATE reply")
 }
 
 pub fn parse_selected_channel(data: Value) -> Result<Option<VoiceChannel>> {
@@ -407,6 +424,24 @@ mod tests {
         assert_eq!(ch.voice_states[0].display_name(), "test");
         assert!(ch.voice_states[0].voice_state.as_ref().unwrap().self_mute);
         assert_eq!(ch.voice_states[1].display_name(), "Mason G");
+        assert_eq!(
+            ch.voice_states[0].user.avatar.as_deref(),
+            Some("b004ec1740a63ca06ae2e14c5cee11f3")
+        );
+        assert_eq!(ch.voice_states[1].user.avatar, None);
+    }
+
+    #[test]
+    fn parses_authenticated_user() {
+        let data = json!({
+            "access_token": "placeholder",
+            "user": {"id": "42", "username": "me", "discriminator": "0", "avatar": "abc"},
+            "scopes": ["rpc"]
+        });
+        let user = parse_authenticated_user(&data).unwrap();
+        assert_eq!(user.id, "42");
+        assert_eq!(user.avatar.as_deref(), Some("abc"));
+        assert!(parse_authenticated_user(&json!({})).is_err());
     }
 
     #[test]
