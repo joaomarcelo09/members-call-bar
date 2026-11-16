@@ -48,7 +48,7 @@ Commands:
             reconnects automatically when Discord restarts
   slot <n>  print slot n for a Waybar `image` module (0..slots-1: members,
             slot `slots`: \"+K\" overflow): image path and tooltip, or
-            nothing when the slot is empty
+            a transparent 1x1 image path when the slot is empty
   status    tell whether the daemon runs and what call it shows
   focus     run `focus_command` (Waybar on-click) to raise Discord
   watch     print the daemon's local JSON API stream (one line per change)
@@ -266,13 +266,17 @@ async fn run_state() -> Result<()> {
     result
 }
 
-/// `slot <n>`: prints the slot or nothing. Never fails, never blocks on
-/// anything but two small local files.
+/// `slot <n>`: prints the slot, or a transparent image path when it is
+/// empty (or the daemon is down, or `n` is invalid): Waybar's `image`
+/// module needs a valid path. Never fails, never blocks on anything but
+/// small local files.
 fn print_slot(arg: Option<&str>) {
+    let dir = output::default_dir().ok();
     let text = arg
         .and_then(|n| n.parse::<usize>().ok())
-        .zip(output::default_dir().ok())
-        .and_then(|(n, dir)| output::read_slot(&dir, n));
+        .zip(dir.as_deref())
+        .and_then(|(n, dir)| output::read_slot(dir, n))
+        .or_else(|| output::empty_slot_text(dir.as_deref()));
     if let Some(text) = text {
         // Ignore errors such as a closed pipe.
         let _ = std::io::stdout().lock().write_all(text.as_bytes());
